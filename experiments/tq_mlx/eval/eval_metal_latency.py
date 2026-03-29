@@ -1,11 +1,30 @@
+"""
+eval_metal_latency.py — Custom Metal kernel benchmark for TurboQuant.
+
+Prototype script that loads the raw Metal Shading Language kernel from
+tq_kernels.metal and benchmarks it against a pure NumPy baseline via
+MLX's mx.fast.metal_kernel() custom kernel compilation API.
+
+This demonstrates the path to writing fully custom Metal compute shaders
+for codebook decode operations, bypassing MLX's built-in op graph for
+maximum GPU throughput.
+
+Usage:
+    PYTHONPATH=. python experiments/tq_mlx/eval/eval_metal_latency.py
+"""
+
 import mlx.core as mx
 import time
 import numpy as np
 
-# A small prototype script showing how to bind the Metal kernel in MLX
-# and time it vs. the pure numpy implementation.
 
 def run_metal_benchmark(n=8192, d=128):
+    """Run custom Metal kernel vs NumPy benchmark.
+
+    Args:
+        n: Sequence length / number of cached tokens (default 8192).
+        d: Head dimension (default 128).
+    """
     print(f"Benchmarking Quantized Prefix Logits (N={n}, D={d})")
     
     # 1. Setup Data in Numpy (for verification)

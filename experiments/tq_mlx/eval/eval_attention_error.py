@@ -1,13 +1,42 @@
+"""
+eval_attention_error.py — Accuracy evaluation: dense vs quantized attention.
+
+Compares the full TurboQuant quantized attention pipeline against a dense
+FP32 baseline to measure the numerical error introduced by:
+    - 4-bit grouped codebook quantization of K and V
+    - PolarQuant outlier calibration (top 5% dense, rest scaled + quantized)
+
+Metrics reported:
+    - logit_l1:     Mean absolute error of attention probabilities.
+    - out_l2_full:  L2 norm of output error (full pipeline, K + V quantized).
+    - out_l2_v_only: L2 norm of output error isolating V quantization
+                     (using dense-exact attention weights with quantized V).
+
+Usage:
+    PYTHONPATH=. python experiments/tq_mlx/eval/eval_attention_error.py
+"""
 
 import numpy as np
-from mlx_lm.turboquant.quantized_attention import quantized_attention
-from mlx_lm.turboquant.prefix_v import decode_prefix_v
+from _mlx_lm_tq.turboquant.quantized_attention import quantized_attention
+from _mlx_lm_tq.turboquant.prefix_v import decode_prefix_v
+
 
 def dense_attention(q, k, v):
+    """Standard dense FP32 attention (ground truth baseline).
+
+    Args:
+        q: Query vector, shape [d].
+        k: Key matrix, shape [n, d].
+        v: Value matrix, shape [n, d].
+
+    Returns:
+        Tuple of (probs, output) — attention weights and output vector.
+    """
     logits = k @ q
     ex = np.exp(logits - np.max(logits))
     probs = ex / (np.sum(ex) + 1e-9)
     return probs, probs @ v
+
 
 def run_eval(d=128, n=256):
     rng = np.random.default_rng(0)

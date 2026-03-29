@@ -1,8 +1,25 @@
+// ============================================================================
+// tq_kernels.metal — TurboQuant Metal Shading Language kernels for Apple GPU.
+//
+// Low-level Metal compute shaders for quantized KV-cache attention.
+// These kernels are dispatched by MLX via mx.fast.metal_kernel() for
+// maximum throughput on Apple Silicon (M1/M2/M3/M4) unified memory.
+//
+// Kernel: prefix_logits_kernel
+//   Computes: logits[i] = sum_j( q[j] * codebooks[group[j]][codes[i,j]] * scales[j] )
+//   Threading: One GPU thread per sequence token (N threads total).
+//   Each thread iterates over D dimensions to compute a single dot product.
+//
+// Performance target: <0.1 ms for N=8192, D=128.
+// ============================================================================
+
 #include <metal_stdlib>
 using namespace metal;
 
-// Computes dot product: q @ quantized_k
-// One thread per sequence token (N)
+// Computes dot product: q @ decoded_quantized_k for one token per thread.
+// Grid: (N, 1, 1) — one thread per sequence position.
+// Each thread decodes its row of codes through the grouped codebook,
+// applies PolarQuant per-channel scaling, and accumulates the dot product.
 kernel void prefix_logits_kernel(
     device const float *q [[buffer(0)]],
     device const uint8_t *codes_k [[buffer(1)]],

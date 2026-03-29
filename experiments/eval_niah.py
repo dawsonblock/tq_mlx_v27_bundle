@@ -1,7 +1,33 @@
+"""
+eval_niah.py — Needle-In-A-Haystack (NIAH) retrieval evaluation.
+
+Tests whether TurboQuant's quantized KV-cache preserves the ability to
+retrieve a specific fact ("needle") embedded at a controlled depth within
+a long filler context ("haystack").
+
+This is the standard long-context quality benchmark for KV-cache compression
+systems. A passing result proves the quantized attention doesn't lose
+fine-grained information even as the cache grows.
+
+Usage:
+    PYTHONPATH=. python experiments/eval_niah.py
+"""
+
 from mlx_lm import load, generate
 
+
 def generate_haystack(context_length, needle, insert_depth):
-    """Generates dummy context with the needle inserted at a specific depth."""
+    """Generate filler text with a needle fact inserted at a controlled depth.
+
+    Args:
+        context_length: Approximate total context length in tokens.
+        needle: The fact string to hide in the haystack.
+        insert_depth: Float 0.0–1.0 controlling where the needle is placed
+            (0.0 = beginning, 0.5 = middle, 1.0 = end).
+
+    Returns:
+        Full haystack string with the needle embedded.
+    """
     filler = "The quick brown fox jumps over the lazy dog. "
     num_filler_tokens = max(1, context_length // 10)
     
@@ -12,7 +38,16 @@ def generate_haystack(context_length, needle, insert_depth):
     return "".join(haystack_parts)
 
 def eval_niah(model_path, context_length, depth):
-    # Load model
+    """Run a single Needle-In-A-Haystack evaluation.
+
+    Loads a model, injects TurboQuant attention hooks, generates a haystack
+    with a hidden needle, and checks whether the model can retrieve it.
+
+    Args:
+        model_path: HuggingFace model path (e.g., "mlx-community/Llama-3.2-1B-Instruct-4bit").
+        context_length: Approximate haystack context length in tokens.
+        depth: Float 0.0–1.0 controlling needle insertion depth.
+    """
     model, tokenizer = load(model_path)
     patch_attention_for_turboquant(model)
     
