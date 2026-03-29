@@ -26,6 +26,7 @@ See Also:
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+import types
 from typing import Optional, Any, Tuple, Dict, List
 
 # ---------------------------------------------------------
@@ -545,6 +546,8 @@ class TurboQuantCache:
 # 4. Two-Stage Scaled Dot-Product Attention
 # ---------------------------------------------------------
 
+_original_sdpa = mx.fast.scaled_dot_product_attention
+
 def turboquant_sdpa(
     queries: mx.array,
     keys: Any,
@@ -573,12 +576,24 @@ def turboquant_sdpa(
     Returns:
         Attention output [B, n_heads, L, head_dim]
     """
-    if hasattr(keys, "k_tail") and keys._prefix_k is not None:
+    if hasattr(keys, "k_tail") and keys._prefix_k is not None and (mask is None or isinstance(mask, mx.array)):
         # Optimized execution path: MLX fallback for multi-head batch since
         # raw Metal bindings for 4D tensors are complex to stub inline.
         # 1. Extract the dense tail
         k_tail = keys.k_tail
         v_tail = keys.v_tail
+
+        # Handle Grouped Query Attention (GQA) by repeating KV heads if necessary
+        n_q_heads = queries.shape[1]
+        n_kv_heads = k_tail.shape[1]
+        
+        def repeat_kv(x):
+            if n_q_heads != n_kv_heads:
+                return mx.repeat(x, n_q_heads // n_kv_heads, axis=1)
+            return x
+            
+        k_tail = repeat_kv(k_tail)
+        v_tail = repeat_kv(v_tail)
 
         # 2. Extract the quantized prefix
         prefix_k_chunks = keys._prefix_k
@@ -589,7 +604,7 @@ def turboquant_sdpa(
         # Due to 4D batch/head layouts, we use pure MLX ops for the fallback.
         scores_prefix_chunks = []
         for pk in prefix_k_chunks:
-            k_chunk = polarquant_decompress(pk)
+            k_chunk = repeat_kv(polarquant_decompress(pk))
             score_chunk = mx.matmul(queries, k_chunk.transpose(0, 1, 3, 2)) * scale
             scores_prefix_chunks.append(score_chunk)
 
@@ -622,7 +637,7 @@ def turboquant_sdpa(
             out_prefix_chunks = []
             offset = 0
             for pv in prefix_v_chunks:
-                v_chunk = polarquant_decompress(pv)
+                v_chunk = repeat_kv(polarquant_decompress(pv))
                 chunk_len = v_chunk.shape[2]
                 probs_chunk = probs_prefix[..., offset : offset + chunk_len]
                 out_chunk = mx.matmul(probs_chunk, v_chunk)
@@ -641,8 +656,11 @@ def turboquant_sdpa(
         # Temporarily use dense reconstruction if cache object is passed
         keys, values = keys.get_dense_all()
 
-    return mx.fast.scaled_dot_product_attention(
-        queries, keys, values, scale=scale, mask=mask
+    # strip cache from kwargs if present, since original sdpa doesn't accept it
+    kwargs.pop("cache", None)
+
+    return _original_sdpa(
+        queries, keys, values, scale=scale, mask=mask, **kwargs
     )
 
 
@@ -662,32 +680,32 @@ def _make_tq_attention_call(original_call, attn_module):
     This preserves full compatibility with the original model while adding
     transparent KV-cache compression.
     """
-    def patched_call(x, mask=None, cache=None):
+    def patched_call(self, x, mask=None, cache=None, **kwargs):
         B, L, D = x.shape
 
-        queries = attn_module.q_proj(x)
-        keys = attn_module.k_proj(x)
-        values = attn_module.v_proj(x)
+        queries = self.q_proj(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
 
-        queries = queries.reshape(B, L, attn_module.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, attn_module.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, attn_module.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            queries = attn_module.rope(queries, offset=cache.offset)
-            keys = attn_module.rope(keys, offset=cache.offset)
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            queries = attn_module.rope(queries)
-            keys = attn_module.rope(keys)
+            queries = self.rope(queries)
+            keys = self.rope(keys)
 
         # Use standard SDPA on dense-reconstructed cache
         output = turboquant_sdpa(
-            queries, keys, values, scale=attn_module.scale, mask=mask
+            queries, keys, values, scale=self.scale, mask=mask, **kwargs
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return attn_module.o_proj(output)
+        return self.o_proj(output)
 
     return patched_call
 
@@ -759,6 +777,12 @@ def patch_attention_for_turboquant(model, tail_size=256, outlier_percent=0.05):
     num_layers = len(layers)
     patched = 0
 
+    # Globally patch SDPA so any un-patched paths that use the cache object don't crash
+    import sys
+    for mod_name, mod in list(sys.modules.items()):
+        if mod_name.startswith("mlx_lm.models") and hasattr(mod, "scaled_dot_product_attention"):
+            setattr(mod, "scaled_dot_product_attention", turboquant_sdpa)
+
     for i, layer in enumerate(layers):
         attn = layer.self_attn if hasattr(layer, "self_attn") else None
         if attn is None:
@@ -768,8 +792,8 @@ def patch_attention_for_turboquant(model, tail_size=256, outlier_percent=0.05):
         original_call = attn.__call__
         patched_fn = _make_tq_attention_call(original_call, attn)
 
-        # Monkey-patch the attention module's __call__
-        attn.__call__ = patched_fn
+        # Monkey-patch the attention module's __call__ using MethodType so dunder lookups work
+        attn.__call__ = types.MethodType(patched_fn, attn)
         patched += 1
 
     # Create cache factory

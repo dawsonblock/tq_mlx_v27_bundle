@@ -67,5 +67,8 @@ if __name__ == "__main__":
     evaluate_perplexity_chunked(model, tokenizer, max_tokens=2048, chunk_size=256)
     
     print("=== TURBOQUANT (Chunked) ===")
+    from patch_sdpa import patch_sdpa_globally
+    from _mlx_lm_tq.turboquant.mlx_integration import turboquant_sdpa
+    patch_sdpa_globally(turboquant_sdpa)
     patch_attention_for_turboquant(model)
     evaluate_perplexity_chunked(model, tokenizer, max_tokens=2048, chunk_size=256)
