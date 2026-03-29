@@ -1,0 +1,11 @@
+{
+  "format_version": 9,
+  "grouped_codebooks": true,
+  "bit_packed": true,
+  "threadgroup_tiled": true,
+  "full_attention": true,
+  "softmax_enabled": true,
+  "prefix_v_enabled": true,
+  "mlx_integration_stub": true,
+  "effective_bits_per_channel": 3.5
+}
