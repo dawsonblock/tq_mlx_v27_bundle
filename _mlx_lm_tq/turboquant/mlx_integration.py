@@ -192,7 +192,7 @@ def polarquant_compress(
     group_size: int = 32,
     bits: int = 4,
 ) -> Dict[str, mx.array]:
-    """Compress a dense [N, D] tensor using MLX quantization + PolarQuant outliers.
+    """Compress a dense tensor using MLX quantization + PolarQuant outliers.
 
     Hybrid approach:
         1. Identify top `outlier_percent` dimensions by magnitude → keep dense FP
@@ -203,7 +203,7 @@ def polarquant_compress(
     heavy-tailed distributions much better than uniform codebooks.
 
     Args:
-        tensor: Dense tensor, mx.array shape [N, D] (float16/float32).
+        tensor: Dense tensor, mx.array shape [..., D] (float16/float32).
         num_groups: (unused, kept for API compat) Number of codebook groups.
         num_codes: (unused, kept for API compat) Codes per group.
         outlier_percent: Fraction of dimensions kept at full precision.
@@ -214,32 +214,37 @@ def polarquant_compress(
         Dict with keys: quantized (data, scales, biases from mx.quantize),
                         outlier_idx, outlier_val, shape, dtype
     """
-    N, D = tensor.shape
+    original_shape = tensor.shape
+    D = original_shape[-1]
+    
     orig_dtype = tensor.dtype
     tensor_f32 = tensor.astype(mx.float32) if tensor.dtype != mx.float32 else tensor
+    tensor_2d = mx.reshape(tensor_f32, (-1, D))
 
     # --- 1. Outlier Detection ---
     num_outliers = max(1, int(D * outlier_percent))
-    col_magnitudes = mx.mean(mx.abs(tensor_f32), axis=0)
+    col_magnitudes = mx.mean(mx.abs(tensor_2d), axis=0)
     mx.eval(col_magnitudes)
     sorted_idx = mx.argsort(-col_magnitudes)
     mx.eval(sorted_idx)
     outlier_idx = sorted_idx[:num_outliers]
     outlier_list = outlier_idx.tolist()
-    outlier_val = tensor[:, outlier_list]  # [N, num_outliers] at original precision
+    outlier_val = tensor[..., outlier_list]  # [..., num_outliers] at original precision
 
     # --- 2. Zero out outlier columns before quantization ---
     # This ensures outlier dims don't distort the quantization of other dims
     tensor_for_quant = mx.array(tensor_f32)
     for dim in outlier_list:
-        tensor_for_quant[:, dim] = 0.0
+        tensor_for_quant[..., dim] = 0.0
 
     # --- 3. MLX native quantization (affine per-group) ---
     # Pad D to be divisible by group_size if needed
     pad_d = (group_size - D % group_size) % group_size
     if pad_d > 0:
+        pad_shape = list(original_shape)
+        pad_shape[-1] = pad_d
         tensor_for_quant = mx.concatenate(
-            [tensor_for_quant, mx.zeros((N, pad_d))], axis=1
+            [tensor_for_quant, mx.zeros(pad_shape, dtype=tensor_for_quant.dtype)], axis=-1
         )
     mx.eval(tensor_for_quant)
 
@@ -254,7 +259,7 @@ def polarquant_compress(
         "quant_biases": quant_biases,
         "outlier_idx": outlier_idx,
         "outlier_val": outlier_val,
-        "shape": (N, D),
+        "shape": original_shape,
         "pad_d": pad_d,
         "group_size": group_size,
         "bits": bits,
@@ -272,9 +277,10 @@ def polarquant_decompress(compressed: Dict[str, mx.array]) -> mx.array:
         compressed: Dict from polarquant_compress().
 
     Returns:
-        Reconstructed tensor, mx.array shape [N, D] at original dtype.
+        Reconstructed tensor, mx.array shape [..., D] at original dtype.
     """
-    N, D = compressed["shape"]
+    original_shape = compressed["shape"]
+    D = original_shape[-1]
     pad_d = compressed["pad_d"]
 
     # MLX dequantize
@@ -288,7 +294,7 @@ def polarquant_decompress(compressed: Dict[str, mx.array]) -> mx.array:
 
     # Remove padding
     if pad_d > 0:
-        decoded = decoded[:, :D]
+        decoded = decoded[..., :D]
 
     # Restore outlier columns at full precision
     outlier_idx = compressed["outlier_idx"]
@@ -296,7 +302,7 @@ def polarquant_decompress(compressed: Dict[str, mx.array]) -> mx.array:
     if outlier_idx is not None:
         outlier_list = outlier_idx.tolist()
         for i, dim in enumerate(outlier_list):
-            decoded[:, dim] = outlier_val[:, i].astype(decoded.dtype)
+            decoded[..., dim] = outlier_val[..., i].astype(decoded.dtype)
 
     return decoded.astype(compressed["dtype"])
 
@@ -399,8 +405,8 @@ class TurboQuantCache:
         if self._tail_len > self.tail_capacity:
             self._compress_tail_overflow()
 
-        # Return dense representation of full cache
-        return self._get_dense_all()
+        # Return (self, self) instead of full dense reconstruction
+        return (self, self)
 
     def _compress_tail_overflow(self):
         """Move the oldest half of the tail to the quantized prefix."""
@@ -415,83 +421,53 @@ class TurboQuantCache:
         self.v_tail = self.v_tail[:, :, half:, :]
         self._tail_len = self.k_tail.shape[2]
 
-        # Compress each head separately
-        B = k_chunk.shape[0]
-        n_heads = k_chunk.shape[1]
+        k_compressed = polarquant_compress(
+            k_chunk,
+            outlier_percent=self.outlier_percent,
+        )
+        v_compressed = polarquant_compress(
+            v_chunk,
+            outlier_percent=self.outlier_percent,
+        )
 
-        for b in range(B):
-            for h in range(n_heads):
-                k_head = k_chunk[b, h]  # [half, head_dim]
-                v_head = v_chunk[b, h]  # [half, head_dim]
+        # Accumulate into prefix as list of chunks
+        if self._prefix_k is None:
+            self._prefix_k = []
+            self._prefix_v = []
 
-                k_compressed = polarquant_compress(
-                    k_head,
-                    outlier_percent=self.outlier_percent,
-                )
-                v_compressed = polarquant_compress(
-                    v_head,
-                    outlier_percent=self.outlier_percent,
-                )
-
-                # Accumulate into prefix as list of chunks
-                if self._prefix_k is None:
-                    self._prefix_k = [[[] for _ in range(n_heads)] for _ in range(B)]
-                    self._prefix_v = [[[] for _ in range(n_heads)] for _ in range(B)]
-
-                self._prefix_k[b][h].append(k_compressed)
-                self._prefix_v[b][h].append(v_compressed)
+        self._prefix_k.append(k_compressed)
+        self._prefix_v.append(v_compressed)
 
         self._prefix_len = self.offset - self._tail_len
 
-    def _decode_prefix_head(self, prefix_data: List[Dict]) -> mx.array:
-        """Decode a head's list of compressed chunks back to dense [N, D]."""
-        if prefix_data is None or len(prefix_data) == 0:
-            return None
-        decoded_chunks = [polarquant_decompress(chunk) for chunk in prefix_data]
-        return mx.concatenate(decoded_chunks, axis=0)
-
-    def _get_dense_all(self) -> Tuple[mx.array, mx.array]:
+    def get_dense_all(self) -> Tuple[mx.array, mx.array]:
         """Reconstruct the full dense KV cache (prefix decoded + tail)."""
         if self._prefix_k is None:
             return self.k_tail, self.v_tail
 
-        B = self._B
-        n_heads = self._n_kv_heads
-        head_dim = self._head_dim
+        # Decode all chunks
+        k_chunks = [polarquant_decompress(chunk) for chunk in self._prefix_k]
+        v_chunks = [polarquant_decompress(chunk) for chunk in self._prefix_v]
 
-        all_keys = []
-        all_values = []
-        for b in range(B):
-            head_keys = []
-            head_values = []
-            for h in range(n_heads):
-                k_prefix = self._decode_prefix_head(self._prefix_k[b][h])
-                v_prefix = self._decode_prefix_head(self._prefix_v[b][h])
+        # Concatenate along the sequence dimension (axis=2)
+        k_prefix = mx.concatenate(k_chunks, axis=2)
+        v_prefix = mx.concatenate(v_chunks, axis=2)
 
-                if k_prefix is not None:
-                    k_full = mx.concatenate([k_prefix, self.k_tail[b, h]], axis=0)
-                    v_full = mx.concatenate([v_prefix, self.v_tail[b, h]], axis=0)
-                else:
-                    k_full = self.k_tail[b, h]
-                    v_full = self.v_tail[b, h]
+        k_full = mx.concatenate([k_prefix, self.k_tail], axis=2)
+        v_full = mx.concatenate([v_prefix, self.v_tail], axis=2)
 
-                head_keys.append(mx.expand_dims(k_full, axis=0))
-                head_values.append(mx.expand_dims(v_full, axis=0))
+        return k_full, v_full
 
-            all_keys.append(mx.expand_dims(mx.concatenate(head_keys, axis=0), axis=0))
-            all_values.append(mx.expand_dims(mx.concatenate(head_values, axis=0), axis=0))
-
-        keys_out = mx.concatenate(all_keys, axis=0)      # [B, n_heads, total, D]
-        values_out = mx.concatenate(all_values, axis=0)   # [B, n_heads, total, D]
-        return keys_out, values_out
+    def _get_dense_all(self) -> Tuple[mx.array, mx.array]:
+        return self.get_dense_all()
 
     def get_prefix_cache(self, b: int = 0, h: int = 0) -> Optional[List[Dict]]:
         """Get quantized prefix chunks for a specific batch/head."""
         if self._prefix_k is None:
             return None
         return {
-            "k": self._prefix_k[b][h],
-            "v": self._prefix_v[b][h],
+            "k": self._prefix_k,
+            "v": self._prefix_v,
         }
 
     @property
@@ -597,6 +573,10 @@ def turboquant_sdpa(
     Returns:
         Attention output [B, n_heads, L, head_dim]
     """
+    if hasattr(keys, "get_dense_all"):
+        # Temporarily use dense reconstruction if cache object is passed
+        keys, values = keys.get_dense_all()
+
     return mx.fast.scaled_dot_product_attention(
         queries, keys, values, scale=scale, mask=mask
     )
