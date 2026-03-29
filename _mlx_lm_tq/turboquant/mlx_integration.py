@@ -547,8 +547,8 @@ class TurboQuantCache:
 
 def turboquant_sdpa(
     queries: mx.array,
-    keys: mx.array,
-    values: mx.array,
+    keys: Any,
+    values: Any,
     scale: float,
     mask: Optional[mx.array] = None,
     **kwargs,
@@ -573,6 +573,70 @@ def turboquant_sdpa(
     Returns:
         Attention output [B, n_heads, L, head_dim]
     """
+    if hasattr(keys, "k_tail") and keys._prefix_k is not None:
+        # Optimized execution path: MLX fallback for multi-head batch since
+        # raw Metal bindings for 4D tensors are complex to stub inline.
+        # 1. Extract the dense tail
+        k_tail = keys.k_tail
+        v_tail = keys.v_tail
+
+        # 2. Extract the quantized prefix
+        prefix_k_chunks = keys._prefix_k
+        prefix_v_chunks = keys._prefix_v
+
+        # 3. Compute query dot product against the quantized prefix chunks
+        # STUB: mx.fast.metal_kernel(name="prefix_logits_kernel", ...)
+        # Due to 4D batch/head layouts, we use pure MLX ops for the fallback.
+        scores_prefix_chunks = []
+        for pk in prefix_k_chunks:
+            k_chunk = polarquant_decompress(pk)
+            score_chunk = mx.matmul(queries, k_chunk.transpose(0, 1, 3, 2)) * scale
+            scores_prefix_chunks.append(score_chunk)
+
+        if scores_prefix_chunks:
+            scores_prefix = mx.concatenate(scores_prefix_chunks, axis=-1)
+        else:
+            scores_prefix = None
+
+        # 4. Compute query dot product against the dense tail
+        scores_tail = mx.matmul(queries, k_tail.transpose(0, 1, 3, 2)) * scale
+
+        # 5. Concatenate the scores, apply softmax
+        if scores_prefix is not None:
+            scores = mx.concatenate([scores_prefix, scores_tail], axis=-1)
+        else:
+            scores = scores_tail
+
+        if mask is not None:
+            scores = scores + mask
+
+        probs = mx.softmax(scores, axis=-1)
+
+        # 6. Compute values: STUB: mx.fast.metal_kernel(name="prefix_v_kernel", ...)
+        # Using pure MLX batched matmul as the fallback structure:
+        if scores_prefix is not None:
+            prefix_len = scores_prefix.shape[-1]
+            probs_prefix = probs[..., :prefix_len]
+            probs_tail = probs[..., prefix_len:]
+
+            out_prefix_chunks = []
+            offset = 0
+            for pv in prefix_v_chunks:
+                v_chunk = polarquant_decompress(pv)
+                chunk_len = v_chunk.shape[2]
+                probs_chunk = probs_prefix[..., offset : offset + chunk_len]
+                out_chunk = mx.matmul(probs_chunk, v_chunk)
+                out_prefix_chunks.append(out_chunk)
+                offset += chunk_len
+
+            out_prefix = sum(out_prefix_chunks) if out_prefix_chunks else 0
+            out_tail = mx.matmul(probs_tail, v_tail)
+            
+            # 7. Sum them to get the final output
+            return out_prefix + out_tail
+        else:
+            return mx.matmul(probs, v_tail)
+
     if hasattr(keys, "get_dense_all"):
         # Temporarily use dense reconstruction if cache object is passed
         keys, values = keys.get_dense_all()
