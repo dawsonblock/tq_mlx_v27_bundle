@@ -1,4 +1,0 @@
-Benchmarking MLX Vectorized vs Numpy (N=8192, D=128)
-[Numpy] Latency: 705.78 ms
-[MLX Native Vectorized JIT] Average Latency: 0.019 ms
-Max Diff vs Numpy: 0.000010

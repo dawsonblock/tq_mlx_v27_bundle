@@ -3,26 +3,17 @@ import time
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load
-
 try:
     from datasets import load_dataset
 except ImportError:
-    print("Please install datasets: pip install datasets")
-    exit(1)
-
+    pass
 from _mlx_lm_tq.turboquant.mlx_integration import patch_attention_for_turboquant
 
-def evaluate_perplexity(model, tokenizer, max_tokens=1024):
-    print("Loading wikitext-2-raw-v1...")
-    try:
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    except Exception as e:
-        print(f"Failed to load dataset: {e}")
-        return
-
+def evaluate_perplexity_chunked(model, tokenizer, max_tokens=1024, chunk_size=64):
+    print(f"Loading wikitext-2-raw-v1, evaluating {max_tokens} tokens in chunks of {chunk_size}...")
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     text = "\n\n".join(ds["text"][:200])
     
-    # Simple tokenization
     if hasattr(tokenizer, "encode"):
         tokens = tokenizer.encode(text)
     else:
@@ -31,44 +22,51 @@ def evaluate_perplexity(model, tokenizer, max_tokens=1024):
             tokens = tokens[0]
 
     tokens = tokens[:max_tokens]
-    print(f"Evaluating over {len(tokens)} tokens.")
     
-    if len(tokens) < 2:
-        return
-
-    # In a full-sequence evaluation, the entire sequence is put in at once.
-    # To test KV-cache effectively, we step through token by token to build cache.
-    # Or, with chunking in turboquant_sdpa, passing it all also works!
+    from _mlx_lm_tq.turboquant.mlx_integration import TurboQuantCache
     
-    # We do a single prefill pass here since we patched attention.
-    # TurboQuant hooks directly into the MLX SDPA calls.
-    x = mx.array(tokens[:-1])[None]  # shape [1, L]
-    targets = mx.array(tokens[1:])[None]  # shape [1, L]
+    # We will step through the model chunk by chunk
+    cache = model.make_cache()
+    losses = []
     
     start_time = time.time()
-    logits = model(x)
-    mx.eval(logits)
+    
+    for i in range(0, len(tokens) - 1, chunk_size):
+        end_i = min(i + chunk_size, len(tokens) - 1)
+        chunk = tokens[i:end_i]
+        targets = tokens[i+1:end_i+1]
+        
+        x = mx.array(chunk)[None] # [1, L]
+        y = mx.array(targets)[None] # [1, L]
+        
+        logits = model(x, cache=cache)
+        mx.eval(logits)
+        
+        loss = nn.losses.cross_entropy(logits, y)
+        losses.append((mx.sum(loss).item(), len(chunk)))
+        
+        if cache and len(cache) > 0 and isinstance(cache[0], TurboQuantCache):
+            pass # Just tracking
+        
     end_time = time.time()
     
-    # Calculate Cross Entropy Loss
-    loss_fn = nn.losses.cross_entropy
-    loss = loss_fn(logits, targets)
-    avg_loss = mx.mean(loss).item()
+    total_loss = sum(l[0] for l in losses)
+    total_tokens = sum(l[1] for l in losses)
+    avg_loss = total_loss / total_tokens
     
     ppl = math.exp(avg_loss)
-    
     print(f"PPL: {ppl:.4f}")
     print(f"Loss: {avg_loss:.4f}")
-    print(f"Eval Time: {end_time - start_time:.4f} s")
+    print(f"Time: {end_time - start_time:.4f} s\n")
 
 if __name__ == "__main__":
     model_path = "mlx-community/Llama-3.2-1B-Instruct-4bit"
     
-    print("=== DENSE BASELINE ===")
+    print("=== DENSE BASELINE (Chunked) ===")
     model, tokenizer = load(model_path)
-    evaluate_perplexity(model, tokenizer, max_tokens=1024)
+    evaluate_perplexity_chunked(model, tokenizer, max_tokens=2048, chunk_size=256)
     
-    print("\n=== TURBOQUANT ===")
-    # Patch the loaded model
+    print("=== TURBOQUANT (Chunked) ===")
+    from _mlx_lm_tq.turboquant.mlx_integration import patch_attention_for_turboquant
     patch_attention_for_turboquant(model)
-    evaluate_perplexity(model, tokenizer, max_tokens=1024)
+    evaluate_perplexity_chunked(model, tokenizer, max_tokens=2048, chunk_size=256)
